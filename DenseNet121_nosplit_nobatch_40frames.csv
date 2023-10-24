@@ -1,0 +1,2 @@
+frames_to_process,split_no,flops,total_processing_time,single_frame_time,left_output_size,avg_consec_inference_gap,total_left_model_time,total_right_model_time
+40,0,0.0,15.099563,0.377489075,150528,0.36047384615384626,1.027087,0
