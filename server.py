@@ -16,7 +16,7 @@ device = config['server_device']
 model_name = config['model']
 split_point = None
 
-BATCH_SIZE = 1
+BATCH_SIZE = 2
 client_data_queue = []
 client_response_futures = []
 unique_clients = set()
