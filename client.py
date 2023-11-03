@@ -63,36 +63,38 @@ def handle_response(response):
 
     # Process the response here
     load_batch_data = pickle.loads(response.body)
-    for load_data in load_batch_data:
-	    result = load_data['result']
-	    frame_seq_no = load_data['frame_seq_no']
+    print(len(load_batch_data),load_batch_data)
+    #for load_data in load_batch_data():
+    #print(load_batch_data)
+    result = load_batch_data['result']
+    frame_seq_no = load_batch_data['frame_seq_no']
 
-	    Logger.log(f'Processed frame # {frame_seq_no}')
-	    print(result.shape)
-	    total_handled_responses += 1
-	    # First frame that is processed. Record its end time. 
-	    if total_handled_responses == 1:
-	        prev_frame_end_time = datetime.datetime.now()
-	    else:
-	        curr_frame_end_time = datetime.datetime.now()
-	        total_inference_gap += (curr_frame_end_time - prev_frame_end_time).total_seconds()
-	        prev_frame_end_time = curr_frame_end_time
+    Logger.log(f'Processed frame # {frame_seq_no}')
+    print(result.shape)
+    total_handled_responses += 1
+    # First frame that is processed. Record its end time. 
+    if total_handled_responses == 1:
+        prev_frame_end_time = datetime.datetime.now()
+    else:
+        curr_frame_end_time = datetime.datetime.now()
+        total_inference_gap += (curr_frame_end_time - prev_frame_end_time).total_seconds()
+        prev_frame_end_time = curr_frame_end_time
 
-	    if total_handled_responses == frames_to_process:
-		# Calculate total time taken to process all 50 frames.
-                end_time = datetime.datetime.now()
-                time = (end_time - start_time).total_seconds()
-                single_frame_time = time/frames_to_process
-		# Calculate average inference gap between two consequtive frames
-                avg_consec_inference_gap = total_inference_gap/(frames_to_process - 1)
-		# Reset to zero for next loop.
-                total_inference_gap = 0
-                request_total_right_model_time_from_server()
-                log_metrics(split_point, flops, time, single_frame_time, left_output_size, avg_consec_inference_gap, total_left_model_time)
+    if total_handled_responses == frames_to_process:
+    # Calculate total time taken to process all 50 frames.
+            end_time = datetime.datetime.now()
+            time = (end_time - start_time).total_seconds()
+            single_frame_time = time/frames_to_process
+    # Calculate average inference gap between two consequtive frames
+            avg_consec_inference_gap = total_inference_gap/(frames_to_process - 1)
+    # Reset to zero for next loop.
+            total_inference_gap = 0
+            request_total_right_model_time_from_server()
+            log_metrics(split_point, flops, time, single_frame_time, left_output_size, avg_consec_inference_gap, total_left_model_time)
 
 def log_metrics(split_point, flops, time, single_frame_time, left_output_size, avg_consec_inference_gap, total_left_model_time):
     right_model_time_loop_event.wait()
-    write_to_csv(model_name + '_async' + '.csv', metrics_headers, [frames_to_process, split_point, flops, time, single_frame_time, left_output_size, avg_consec_inference_gap, total_left_model_time, total_right_model_time])
+    write_to_csv(model_name + 'client_1' + '.csv', metrics_headers, [frames_to_process, split_point, flops, time, single_frame_time, left_output_size, avg_consec_inference_gap, total_left_model_time, total_right_model_time])
     Logger.log(f'CONSECUTIVE INFERENCE GAP BETWEEN TWO FRAMES:: {avg_consec_inference_gap}')
     Logger.log(f'PROCESSING TIME FOR SINGLE FRAME:: {single_frame_time} sec')
     Logger.log(f'TOTAL LEFT PROCESSING TIME:: {total_left_model_time}')
@@ -107,7 +109,7 @@ async def consumer():
     async for item in q:
         try:   
             Logger.log(f'[Inside consumer] Frame # {item[1]}: Preparing body to send request to server.')
-            post_data = {'client_id': "client_2",'data': item[0], 'frame_seq_no': item[1]} # item[0] = out_left, item[1] = frame_seq_no
+            post_data = {'client_id': "client_1",'data': item[0], 'frame_seq_no': item[1]} # item[0] = out_left, item[1] = frame_seq_no
             body = pickle.dumps(post_data)            
             # Sending HTTP request to server.
             response =  http_client.fetch(url + 'model',  method = 'POST', headers = None, body = body)
@@ -146,7 +148,7 @@ def get_left_model(split_point):
 # Returns JSON body for sending to server.
 def get_request_body(left_output, frame_seq_no, split_point):
     # Request JSON.
-    request_body = {'client_id': "client_2",'data': left_output, 'frame_seq_no': frame_seq_no, 'split_point': split_point}
+    request_body = {'client_id': "client_1",'data': left_output, 'frame_seq_no': frame_seq_no, 'split_point': split_point}
     return request_body
 
 # Send HTTP request to server.
@@ -194,7 +196,6 @@ async def main_runner():
         cam = cv2.VideoCapture('hdvideo.mp4')
         # This is the start of the video processing. Initialize the start time.
         start_time = datetime.datetime.now()
-    
         while frame_seq_no < frames_to_process + 1:
             # Reading next frame from the input.       
             ret, img_rbg = cam.read()   
@@ -202,7 +203,8 @@ async def main_runner():
             if ret:                 
                 Logger.log(f'[Inside main_runner] Frame # {frame_seq_no}: Send for left processing.')    
                 # Send the frame for left processing.
-                out_left = producer_video_left(img_rbg, left_model)    
+                out_left = producer_video_left(np.array(img_rbg), left_model)   
+                print(img_rbg.shape)                    
                 await q.put([out_left, frame_seq_no])   
 
             # Increment frame count after left processing.    
