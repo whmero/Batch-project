@@ -8,6 +8,7 @@ from tornado.concurrent import Future
 
 from tensorflow import keras
 from modelUtils import Config, Logger, get_model, dry_run_right_model, input_size
+import pandas as pd
 
 # Read the configurations from the config file.
 config = Config.get_config()
@@ -16,7 +17,7 @@ device = config['server_device']
 model_name = config['model']
 split_point = None
 
-BATCH_SIZE = 2
+BATCH_SIZE = 1
 client_data_queue = []
 client_response_futures = []
 unique_clients = set()
@@ -74,7 +75,7 @@ class ModelHandler(tornado.web.RequestHandler):
             for response_future, client_id in client_response_futures:
                 client_responses = batch_response_dict.get(client_id, [])
                 if client_responses:
-                    response_data = client_responses.pop(0)
+                    response_data = client_responses#.pop(0)
                     response_future.set_result(response_data)
                 
             # Clear for next batch
@@ -164,21 +165,16 @@ def model_right(data_batch):
     right_model_output = []
     frame_seq_nos = []
     with tf.device(device):
-        #print(data_batch)
-        #left_model_output = [data['data'] for data in data_batch]
-	#frame_seq_nos = [data['frame_seq_no'] for data in data_batch]
-        for data in data_batch:
-            left_model_output = data['data']
-            frame_seq_nos.append(data['frame_seq_no'])
-
-            Logger.log(f'Executing right model for frame #s: {frame_seq_nos}')
-            right_model_start_time = datetime.datetime.now()
-            right_model_output.append(right_model(left_model_output))
-            right_model_end_time = datetime.datetime.now()
-            add_to_total_right_model_time((right_model_end_time - right_model_start_time).total_seconds())
-
-        return_data_batch = [{'result': right_model_output[i], 'frame_seq_no': frame_seq_nos[i]} for i in range(len(data_batch))]
-
+        #tf.stack(left_model_output)
+        data = pd.DataFrame.from_dict(data_batch[0]) #,columns = ['client_id', 'data','frame_seq_no'])
+        left_model_output = data['data'].tolist()
+        frame_seq_nos = data['frame_seq_no'].tolist() 
+        Logger.log(f'Executing right model for frame #s: {frame_seq_nos}')
+        right_model_start_time = datetime.datetime.now()
+        right_model_output.append(right_model(left_model_output))
+        right_model_end_time = datetime.datetime.now()
+        add_to_total_right_model_time((right_model_end_time - right_model_start_time).total_seconds())
+        return_data_batch = [{'result': right_model_output[0], 'frame_seq_no': len(frame_seq_nos)}]
         return return_data_batch
         
         
@@ -189,48 +185,45 @@ def process_batch(client_data_dict):
     """
     batch_response_dict = {}
     with tf.device(device):
-        # Your model's batch processing logic here...
-        for c_id, data in client_data_dict.items():
-            #return_data = []
-            #for d in data:
-            return_data = model_right(data)
-            if c_id not in batch_response_dict:
-                batch_response_dict[c_id] = []
-            batch_response_dict[c_id].append(return_data)
-
-        # Sample logic: return the received data
+        data_val = list(client_data_dict.values())
+        data_keys = list(client_data_dict.keys())
+        output_data_val = model_right(data_val)
+        batch_response_dict = dict(zip(data_keys, output_data_val))
         return batch_response_dict
-        
-
+    
+    
+def process_split_point(x):
+    global right_model
+    global left_model
+    global split_point
+    batch_response_dict = {}
+    split_layer = model.layers[x]
+    left_model = tf.keras.Model(inputs=model.input, outputs=split_layer.output)
+    next_layer = model.layers[x + 1]
+    print(f'Starting from layer # {x + 1} in server. Layer name: {next_layer.name}')
+    right_model = keras.Model(inputs=next_layer.input, outputs=model.output)
+    dry_run_right_model(left_model, right_model, input_size.get(model_name))
+    return [pickle.dumps('Right model is ready.')]
+    
 def process_split_point_batch(split_point_client_data_dict):
     """
     Your batch processing logic for split point data here...
     For the example, just returning the data as is.
     """
+    
     batch_response_dict = {}
-    global right_model
-    global left_model
-    global split_point
-
+    
     with tf.device(device):
         # Your model's batch processing logic here...
-        for c_id, data in split_point_client_data_dict.items():
-            #return_data = []
-            #for d in data:
-
-            split_point = data['split_point']
-            split_layer = model.layers[split_point]
-            left_model = tf.keras.Model(inputs=model.input, outputs=split_layer.output)
-            next_layer = model.layers[split_point + 1]
-            print(f'Starting from layer # {split_point + 1} in server. Layer name: {next_layer.name}')
-            right_model = keras.Model(inputs=next_layer.input, outputs=model.output)
-            dry_run_right_model(left_model, right_model, input_size.get(model_name))
-            if c_id not in batch_response_dict:
-                batch_response_dict[c_id] = []
-            batch_response_dict[c_id].append(pickle.dumps('Right model is ready.'))
-
+        data = pd.DataFrame(list(split_point_client_data_dict.values()))
+        keys = data['client_id']
+        split_point = data['split_point']
+        output_data_val = map(process_split_point, split_point)
         # Sample logic: return the received data
+        batch_response_dict = dict(zip(keys, output_data_val))
         return batch_response_dict
+    
+
     
 
 def process_time_batch(time_client_data_dict):
