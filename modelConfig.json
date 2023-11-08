@@ -1,6 +1,6 @@
 {
     "server": "localhost",
-    "model": "DenseNet121",
+    "model": "resnet50",
     "client_device": "/CPU:0",
     "server_device": "/CPU:0",
     "frames_to_process": 10,
