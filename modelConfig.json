@@ -3,7 +3,7 @@
     "model": "resnet50",
     "client_device": "/CPU:0",
     "server_device": "/CPU:0",
-    "frames_to_process": 10,
+    "frames_to_process": 32,
     "url": "http://{{server}}:8881/",
-    "models_to_compare": ["resnet50", "resnet101", "VGG16"]
+    "models_to_compare": ["resnet50", "resnet101","DenseNet121"]
 }

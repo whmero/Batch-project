@@ -1,41 +1,38 @@
+import socket
 import cv2
+import math
 import datetime
 import pickle
 import tensorflow as tf
-import tornado.locks
+import json
 import numpy as np
 import pandas as pd
 import warnings
 import io
-
 from tensorflow import keras
-from tornado import httpclient, ioloop
-from tornado.queues import Queue
 from PIL import Image
 from modelUtils import Config, Logger, write_to_csv, get_flops, dry_run_left_model, get_model, convert_image_to_tensor, input_size, my_split_points
 from model_profiler import model_profiler
+import sys
+import base64
+import threading
+import time as t
 
 io.StringIO
 warnings.filterwarnings('ignore')
 
-all_responses_loop_event = tornado.locks.Event()
-right_model_time_loop_event = tornado.locks.Event()
-
 # Read the configurations from the config file.
 config = Config.get_config()
-metrics_headers = ['frames_to_process', 'split_no', 'flops', 'total_processing_time', 'single_frame_time', 'left_output_size', 'avg_consec_inference_gap', 'total_left_model_time', 'total_right_model_time']
-
+metrics_headers = ['frames_to_process', 'split_no', 'total_processing_time', 'single_frame_time', 'left_output_size', 'avg_consec_inference_gap', 'total_left_model_time','total_right_model_time']
 # Assign the configurations to the global variables.
 device = config['client_device']
 url = config['url']
 model_name = config['model']
 frames_to_process = config['frames_to_process']
 
-# Initialize queue for storing the output of the frames that were processed on the client (left) side.
-q = Queue(maxsize=2)
-
 # Initialize the start time to None. This value will be set in main_runner when it is initialized.
 start_time = None
+client = None
 
 # Track total responses handled.
 total_handled_responses = 0
@@ -48,28 +45,143 @@ prev_frame_end_time = None
 left_output_size = 0
 flops = 0
 
-with tf.device(device):
-  model = get_model(model_name)
-  num_layers = len(model.layers)  
-  split_points = my_split_points.get(model_name)
-  print('*************************************************')
-  print(tf.config.list_physical_devices(device_type=None))
-  print('**************************************************')  
+IP = "localhost"
+PORT = 5566
+ADDR = (IP, PORT)
+FORMAT = "utf-8"
+SIZE = 45000
+DENSE = 535285
+RESNET = 1070497
+LIMIT = int(((RESNET * frames_to_process)/2))
+LIMITS_no = int(math.floor(LIMIT /SIZE) + 1)
 
-def handle_response(response):
+
+def get_left_model(split_point):  
+    split_layer = model.layers[split_point]
+    left_model = keras.Model(inputs=model.input, outputs=model.output)
+    return left_model
+# Returns JSON body for sending to server.
+def get_request_body(left_output, frame_seq_no, split_point):
+    # Request JSON.
+    request_body = {'client_id': "client_1", 'total_frames_no': frame_seq_no, 'split_point': split_point}
+    json_data = json.dumps(request_body).encode()
+    return json_data
+
+def producer_video_left(img, left_model):
+    size = input_size.get(model_name)
+    tensor = convert_image_to_tensor(img, size)
+    out_left = left_model(tensor)    
+    return tensor
+
+def main_runner():
+    global split_point
+    global flops
+    sent = 0
+    for split_point in split_points:
+        print('SPLIT: ' + str(split_point))
+        left_model = get_left_model(split_point)
+        dry_run_left_model(left_model,224)
+        profile = model_profiler(left_model, frames_to_process)
+        flops = get_flops(profile)
+        # Request JSON.
+        #request_json = get_request_body(left_model, frames_to_process, split_point)
+        #client.send(request_json)
+        Logger.log(f'SPLIT POINT IS SET TO {split_point} IN SERVER')
+        frame_seq_no = 1
+        global start_time
+        global left_output_size
+        global total_handled_responses
+        global total_left_model_time    
+        # Read the input from the file.
+        cam = cv2.VideoCapture('hdvideo.mp4')
+        # This is the start of the video processing. Initialize the start time.
+        while frame_seq_no < frames_to_process + 1:
+            # Reading next frame from the input.       
+            ret, img_rbg = cam.read()   
+            # If the frame exists
+            if ret:                 
+                Logger.log(f'[Inside main_runner] total_frames_no # {frame_seq_no}: Send for left processing.')    
+                # Send the frame for left processing.
+                out_left = producer_video_left(img_rbg, left_model)  
+                print(out_left.shape) 
+                if out_left.shape != (1, 224, 224, 3):
+                    # Resize the tensor
+                    resized_tensor = tf.image.resize(out_left, size=(224, 224))
+                else:
+                    resized_tensor = out_left
+                data = resized_tensor
+                frame_seq_no = frame_seq_no
+                Logger.log(f'[Inside consumer] Frame # {frame_seq_no}: Preparing body to send request to server.')
+                stack = tf.stack(list(data))
+                encoded_data = base64.b64encode(stack.numpy().tobytes()).decode()
+                post_data = {'client_id': "client_1",'data':encoded_data, 'shape':list(stack.shape),'frame_seq_no': frame_seq_no, 'split_point': split_point}
+                # Serialize the JSON object to a byte array
+                byte_array = json.dumps(post_data).encode()
+                print("byte_array",len(byte_array))
+                start_time = datetime.datetime.now()
+                sent += 1
+                offset = 0
+                while offset < len(byte_array):
+                    # Copy a portion of the byte array into the packet
+                    packet_data = byte_array[offset:offset + SIZE]
+
+                    # Send the packet over UDP
+                    client.send(packet_data)
+
+                    # Update the offset
+                    offset += SIZE
+                
+            # Increment frame count after left processing.    
+            frame_seq_no += 1  
+
+        # This is the end of the left processing. Set the end time of left video processing.
+        end_time = datetime.datetime.now()       
+        left_output_size = tf.size(out_left).numpy()
+        total_left_model_time = (end_time - start_time).total_seconds()    
+    
+        cam.release()
+        cv2.destroyAllWindows()
+
+        # Wait until all the responses for this split point are received and processed.
+        total_handled_responses = 0
+    print("sent "+ str(sent) + " packets!!!!!!")
+
+def handle_response():
     global total_handled_responses
     global total_inference_gap
     global prev_frame_end_time
-
-    # Process the response here
-    load_batch_data = pickle.loads(response.body)
-    for load_data in load_batch_data:
-        #print('xxxxx',load_data,'yyyy',load_batch_data)
+    buffer2 = None
+    buffer = bytearray()
+    for k in split_points:
+        try:
+            for size in range(LIMITS_no):
+                # Receive a packet
+                packet_data = client.recv(SIZE)
+                if buffer2 != None:
+                    packet_data = buffer2 + packet_data
+                    buffer2 = None
+                # Append the received packet data to the buffer
+                buffer.extend(packet_data)
+                try:
+                    index = buffer.index(b"}")
+                    # Create a new byte array up to and including the "}" symbol
+                    temp1 = buffer[index + 1:]
+                    buffer = buffer[:index + 1]
+                    temp2 = buffer2
+                    temp1 += temp2
+                    buffer2 = temp1
+                except:
+                    pass
+            print(f"Received processed buffer : {buffer.decode()}")
+        except BaseException as e:
+            print('handle_response: ' + str(e))
+        load_batch_data = json.loads(buffer.decode())
+        total_right_model_time = load_batch_data['right_model_time']
+        #for load_data in load_batch_data:
         result = load_batch_data['result']
         frame_seq_no = load_batch_data['frame_seq_no']
 
         Logger.log(f'Processed frame # {frame_seq_no}')
-        print(result[0].shape)
         total_handled_responses += 1
         # First frame that is processed. Record its end time. 
         if total_handled_responses == 1:
@@ -79,183 +191,40 @@ def handle_response(response):
             total_inference_gap += (curr_frame_end_time - prev_frame_end_time).total_seconds()
             prev_frame_end_time = curr_frame_end_time
 
-        if total_handled_responses == frames_to_process/10:
-            # Calculate total time taken to process all 50 frames.
-            end_time = datetime.datetime.now()
-            time = (end_time - start_time).total_seconds()
-            single_frame_time = time/frames_to_process
-            # Calculate average inference gap between two consequtive frames
-            avg_consec_inference_gap = total_inference_gap/(frames_to_process - 1)
-            # Reset to zero for next loop.
-            total_inference_gap = 0
-            request_total_right_model_time_from_server()
-            log_metrics(split_point, flops, time, single_frame_time, left_output_size, avg_consec_inference_gap, total_left_model_time)
+        
+        # Calculate total time taken to process all 50 frames.
+        end_time = datetime.datetime.now()
+        time = (end_time - start_time).total_seconds()
+        single_frame_time = time/frames_to_process
+        # Calculate average inference gap between two consequtive frames
+        avg_consec_inference_gap = total_inference_gap/(frames_to_process - 1)
+        # Reset to zero for next loop.
+        total_inference_gap = 0
+        #request_total_right_model_time_from_server()
+        log_metrics(k, time, single_frame_time, left_output_size, avg_consec_inference_gap, total_left_model_time,total_right_model_time)
+     
 
-def log_metrics(split_point, flops, time, single_frame_time, left_output_size, avg_consec_inference_gap, total_left_model_time):
-    right_model_time_loop_event.wait()
-    write_to_csv(model_name + '_async1' + '.csv', metrics_headers, [frames_to_process, split_point, flops, time, single_frame_time, left_output_size, avg_consec_inference_gap, total_left_model_time, total_right_model_time])
+def log_metrics(split_point, time, single_frame_time, left_output_size, avg_consec_inference_gap, total_left_model_time,total_right_model_time):
+    write_to_csv(model_name + '_async1' + '.csv', metrics_headers, [frames_to_process, split_point, time, single_frame_time, left_output_size, avg_consec_inference_gap, total_left_model_time,total_right_model_time])
     Logger.log(f'CONSECUTIVE INFERENCE GAP BETWEEN TWO FRAMES:: {avg_consec_inference_gap}')
     Logger.log(f'PROCESSING TIME FOR SINGLE FRAME:: {single_frame_time} sec')
     Logger.log(f'TOTAL LEFT PROCESSING TIME:: {total_left_model_time}')
-    Logger.log(f'TOTAL RIGHT PROCESSING TIME:: {total_right_model_time}')
     Logger.log(f'TOTAL PROCESSING TIME:: {time} sec')
-    right_model_time_loop_event.clear()
-    all_responses_loop_event.set()
+
+def main():
+    global client
+    global model
+    global num_layers
+    global split_points
+    model = get_model(model_name)
+    num_layers = len(model.layers)  
+    split_points = my_split_points.get(model_name)
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.connect(ADDR)
+    t.sleep(5)
+    main_runner()
+    handle_response()
         
-async def consumer():
-    http_client = httpclient.AsyncHTTPClient(defaults=dict(connect_timeout = 10000000.0 ,request_timeout=100000000000.0))
-    
-    async for item in q:
-        try:   
-            Logger.log(f'[Inside consumer] Frame # {item[1]}: Preparing body to send request to server.')
-            post_data = {'client_id': "client_1",'data': item[0], 'frame_seq_no': item[1]} # item[0] = out_left, item[1] = frame_seq_no
-            body = pickle.dumps(post_data)            
-            # Sending HTTP request to server.
-            response =  http_client.fetch(url + 'model',  method = 'POST', headers = None, body = body)
-            response.add_done_callback(lambda f: handle_response(f.result()))            
 
-        finally:
-            q.task_done()
-
-def request_total_right_model_time_from_server():
-    request_json = get_request_body(None, 0, split_point)
-    http_client = httpclient.AsyncHTTPClient(defaults=dict(connect_timeout = 10000000.0 ,request_timeout=100000000000.0))
-    body = pickle.dumps(request_json) 
-    response = http_client.fetch(url + 'right_model_time',  method = 'POST', headers = None, body = body)
-    response.add_done_callback(lambda f: set_total_right_model_time(f.result()))
-
-def set_total_right_model_time(response):
-    global total_right_model_time
-    x = response.body
-    if type(x) == bytes:
-        # The response data is not serialized
-        response_body = pickle.loads(x)
-        #for response_body in batch_response_body: 
-        #print('yyyyyyyyy',type(response_body),response_body,type(x),x)
-        deserialized_data = pickle.loads(response_body[0])
-        total_right_model_time = deserialized_data['total_right_model_time']
-    elif type(x) == list:
-        # The response data is serialized
-        print("The response is serialized.")
-        response_body = pickle.loads(x[0])
-        deserialized_data = pickle.loads(response_body[0])
-        total_right_model_time = deserialized_data['total_right_model_time']
-        #print('xxxxxxxxx',type(response_body),type(x))
-
-    #total_right_model_time = response_body['total_right_model_time']
-    right_model_time_loop_event.set()
-
-def producer_video_left(img, left_model):
-    size = input_size.get(model_name)
-    tensor = convert_image_to_tensor(img, size)
-    out_left = left_model(tensor)    
-    return out_left
-
-def get_left_model(split_point):    
-    split_layer = model.layers[split_point]
-    print(split_layer.name)  
-    left_model = keras.Model(inputs=model.input, outputs=split_layer.output)
-    return left_model
-
-# Returns JSON body for sending to server.
-def get_request_body(left_output, frame_seq_no, split_point):
-    # Request JSON.
-    request_body = {'client_id': "client_1",'data': left_output, 'frame_seq_no': frame_seq_no, 'split_point': split_point}
-    return request_body
-
-# Send HTTP request to server.
-async def send_request(request_body, endpoint):
-    global client_request_time
-    global server_response_time
-
-    client_request_time = datetime.datetime.now()
-    http_client = httpclient.AsyncHTTPClient(defaults=dict(connect_timeout = 10000000.0 ,request_timeout=100000000000.0))
-    body = pickle.dumps(request_body) 
-    response = None   
-
-    if endpoint == 'split_point' or 'right_model_time':
-        # Wait for the split point to be set in the server.
-        response =  await http_client.fetch(url + endpoint,  method = 'POST', headers = None, body = body)
-    else:
-        response =  http_client.fetch(url + endpoint,  method = 'POST', headers = None, body = body)
-
-    server_response_time = datetime.datetime.now()
-    return response
-
-async def main_runner():
-    global split_point
-    global flops
-
-    for split_point in split_points:
-        print('SPLIT: ' + str(split_point))
-        left_model = get_left_model(split_point)
-        dry_run_left_model(left_model, input_size.get(model_name))
-        profile = model_profiler(left_model, frames_to_process)
-        flops = get_flops(profile)
-
-        # Request JSON.
-        request_json = get_request_body(None, 0, split_point)
-        response = await send_request(request_json, 'split_point')
-        Logger.log(f'SPLIT POINT IS SET TO {split_point} IN SERVER')
-
-        frame_seq_no = 1
-        global start_time
-        global left_output_size
-        global total_handled_responses
-        global total_left_model_time    
-    
-        # Read the input from the file.
-        cam = cv2.VideoCapture('hdvideo.mp4')
-        # This is the start of the video processing. Initialize the start time.
-        start_time = datetime.datetime.now()
-    
-        while frame_seq_no < frames_to_process + 1:
-            # Reading next frame from the input.       
-            ret, img_rbg = cam.read()   
-            # If the frame exists
-            if ret:                 
-                Logger.log(f'[Inside main_runner] Frame # {frame_seq_no}: Send for left processing.')    
-                # Send the frame for left processing.
-                out_left = producer_video_left(img_rbg, left_model)   
-                if out_left.shape != (1, 230, 230, 3):
-                    resized_tensor = tf.image.resize(out_left, size=(230, 230))
-                    # Crop the resized tensor to the desired shape (1, 230, 230, 3)
-                    cropped_tensor = resized_tensor[:, :230, :230, :3]
-                    out_left = cropped_tensor
-
-                q.put([out_left, frame_seq_no])   
-
-            # Increment frame count after left processing.    
-            frame_seq_no += 1    
-
-        # This is the end of the left processing. Set the end time of left video processing.
-        end_time = datetime.datetime.now()    
-        left_output_size = tf.size(out_left).numpy()
-        total_left_model_time = (end_time - start_time).total_seconds()    
-        Logger.log(f'[Inside main_runner] TOTAL TIME TAKEN FOR LEFT PROCESSING {frames_to_process} frames:: {total_left_model_time}')
-    
-        cam.release()
-        cv2.destroyAllWindows()
-
-        # Wait until all the responses for this split point are received and processed.
-        all_responses_loop_event.wait()
-        total_handled_responses = 0
-        all_responses_loop_event.clear()
-
-
-with tf.device(device):
-    if __name__=='__main__':
-        Logger.log('Initialize IOLoop')
-        io_loop = ioloop.IOLoop.current()
-
-        Logger.log('Add main_runner and consumer to Tornado event loop as call back')
-        io_loop.add_callback(main_runner)
-        io_loop.add_callback(consumer) 
-
-        Logger.log('Join the queue')
-        q.join()                # Block until all the items in the queue are processed.
-
-        Logger.log('Start IOLoop')
-        io_loop.start()
-
-        Logger.log('After start IOLoop')
+if __name__ == "__main__":
+    main()

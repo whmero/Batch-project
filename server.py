@@ -1,52 +1,51 @@
+import socket
+import threading
 import pickle
 import datetime
 import tensorflow as tf
-import tornado.ioloop
-
-import tornado.gen
-from tornado.concurrent import Future
-
 from tensorflow import keras
-from keras.applications.densenet import DenseNet121
-from keras import layers, Model, Input
-from modelUtils import Config, Logger, get_model, dry_run_right_model, input_size
+from tensorflow.keras.applications import DenseNet121, ResNet50, ResNet101
+from tensorflow.keras import models
+from keras import Input
+from modelUtils import Config, Logger, get_model, dry_run_right_model, input_size,my_split_points
 import pandas as pd
 import numpy as np
+import math
+import json
+import base64
+import time
+import concurrent.futures
 
+IP = "localhost"
+PORT = 5566
+ADDR = (IP, PORT)
+FORMAT = "utf-8"
 # Read the configurations from the config file.
 config = Config.get_config()
-
 device = config['server_device']
 model_name = config['model']
 split_point = None
 model_config = df = pd.read_json('modelConfig.json')
-batches = int(model_config["frames_to_process"][0])
-
-BATCH_SIZE = 2
-client_data_queue = []
-client_response_futures = []
-unique_clients = set()
+lst_load_batches = []
 
 
-client_data_dict = {} # {client_id: [data1, data2, ...], ...}
-client_response_dict = {} # {client_id: [response1, response2, ...], ...}
-client_response_futures = [] # [(future1, client_id1), (future2, client_id2), ...]
 
+BATCH_SIZE = 3
 
-# For SplitPointHandler
+client_data_dict = {} 
 split_point_client_data_dict = {} 
-split_point_client_response_futures = []
-
-# For TimeHandler
-time_client_data_dict = {} 
-time_client_response_futures = []
 
 
 # Define batch size and initialize a batch list
 batch_input = []
-
 with tf.device(device):
     model = get_model(model_name)
+    split_points = my_split_points.get(model_name)
+    frames_to_process = config['frames_to_process']
+    input_shape = (frames_to_process*224,224,3)
+    SIZE = 45000
+    LIMIT = 802917
+    LIMITS_no = int(math.floor(LIMIT /SIZE) + 1)
     print('*************************************************')
     print(tf.config.list_physical_devices(device_type=None))
     print('**************************************************')
@@ -55,230 +54,176 @@ with tf.device(device):
     right_model = None
     total_right_model_time = 0
 
-
-class ModelHandler(tornado.web.RequestHandler):
-    @tornado.gen.coroutine
-    def post(self):
-        received = pickle.loads(self.request.body)
-        data = received
-        client_id = received['client_id']
+def post_process_batch(batch):
+    df = pd.DataFrame.from_dict(batch)
+    json_data = {}
+    encoded_data_list = df['data'].tolist()
+    # Decode the data strings into numpy arrays
+    decoded_data_list = [np.frombuffer(tf.io.decode_raw(base64.b64decode(encoded_data), tf.float32), dtype=np.float32) for encoded_data in encoded_data_list]
+    concatenated_data = np.concatenate(decoded_data_list, axis=0)
+    # Convert the concatenated data to a tensor
+    tensor_data = tf.convert_to_tensor(concatenated_data)
+    # Convert the byte array to a tensor
+    lst = [len(batch)] + df['shape'].tolist()[0]
+    tensor_shape = tuple(lst)
+    tensor = tf.reshape(tensor_data, tensor_shape)
+    # Updating Dictionary Values
+    json_data["data"] = tensor
+    client_id = df['client_id'].tolist()[0]
+    json_data["client_id"] = client_id
+    
+    batch_response_dict = process_batch(json_data)
+    
+    return batch_response_dict
         
-        future = Future()
-        # Store data and its associated future
-        if client_id not in client_data_dict:
-            client_data_dict[client_id] = []
-        client_data_dict[client_id].append(data)
-        
-        client_response_futures.append((future, client_id))
-        if len(client_data_dict) >= BATCH_SIZE:
-            # For simplicity, let's assume process_batch returns a dictionary: {client_id: [processed_data1, processed_data2, ...], ...}
-            batch_response_dict = process_batch(client_data_dict)
-            
-            
-            # Resolve all futures
-            for response_future, client_id in client_response_futures:
-                client_responses = batch_response_dict.get(client_id, [])
-                if client_responses:
-                    response_data = client_responses#.pop(0)
-                    response_future.set_result(response_data)
-                
-            # Clear for next batch
-            client_data_dict.clear()
-            client_response_futures.clear()
-
-        response_data = yield future
-        self.write(pickle.dumps(response_data))
-        
-        
-
-
-class SplitPointHandler(tornado.web.RequestHandler):
-    @tornado.gen.coroutine
-    def post(self):
-        received = pickle.loads(self.request.body)
-        data = received
-        client_id = received['client_id']
-
-        future = Future()
-
-        if client_id not in split_point_client_data_dict:
-            split_point_client_data_dict[client_id] = {}
-        split_point_client_data_dict[client_id] = data
-
-        split_point_client_response_futures.append((future, client_id))
-
-        if len(split_point_client_data_dict) >= BATCH_SIZE:
-            batch_response_dict =  process_split_point_batch(split_point_client_data_dict)
-            for response_future, client_id in split_point_client_response_futures:
-                client_responses = batch_response_dict.get(client_id, [])
-                if client_responses:
-                    response_data = client_responses#.pop(0)
-                    response_future.set_result(response_data)
-            split_point_client_data_dict.clear()
-            split_point_client_response_futures.clear()
-
-        response_data = yield future
-        self.write(pickle.dumps(response_data))
-
-
-
-class TimeHandler(tornado.web.RequestHandler):
-    @tornado.gen.coroutine
-    def post(self):
-        received = pickle.loads(self.request.body)
-        data = received
-        client_id = received['client_id']
-
-        future = Future()
-
-        if client_id not in time_client_data_dict:
-            time_client_data_dict[client_id] = {}
-        time_client_data_dict[client_id] = data
-
-        time_client_response_futures.append((future, client_id))
-
-        if len(time_client_data_dict) >= BATCH_SIZE:
-            batch_response_dict = process_time_batch(time_client_data_dict)
-            for response_future, client_id in time_client_response_futures:
-                client_responses = batch_response_dict.get(client_id, [])
-                if client_responses:
-                    response_data = client_responses #.pop(0)
-                    response_future.set_result(response_data)
-            time_client_data_dict.clear()
-            time_client_response_futures.clear()
-
-        response_data = yield future
-        self.write(pickle.dumps(response_data))
-
-
 def model_right(data_batch):
-    right_model_output = []
+    right_model_output = None
     frame_seq_nos = []
     with tf.device(device):
-
-
-
-        one_lst = sum(data_batch, [])
-        data = pd.DataFrame.from_dict(one_lst) #,columns = ['client_id', 'data','frame_seq_no'])
-        left_model_output = data['data'].tolist()
-        frame_seq_nos = data['frame_seq_no'].tolist() 
-        #inputs = tf.keras.Input(tf.stack(left_model_output).shape)
-        ip_shape1 = tf.keras.Input(tf.stack(left_model_output).shape)
-        dense_1 = tf.keras.layers.Dense(4, activation=tf.nn.relu)
-        dense_2 = tf.keras.layers.Dense(4, activation=tf.nn.relu)
-        op1 = dense_1(ip_shape1)
-        op1 = dense_2(op1)
-        model_custom = tf.keras.models.Model(inputs=[ip_shape1], outputs=[op1])
-        Logger.log(f'Executing right model for frame #s: {len(frame_seq_nos)}')
-        right_model_start_time = datetime.datetime.now()
-        stacked_tensors = tf.stack(left_model_output)
-        reshaped_tensor = tf.reshape(stacked_tensors, (-1, stacked_tensors.shape[0], stacked_tensors.shape[1], stacked_tensors.shape[2], 
-        stacked_tensors.shape[3], 3)) 
-        right_model_output.append(model_custom(reshaped_tensor))
-        #right_model_output.append(right_model(left_model_output))
+        try:
+            print(data_batch.shape,"data_batch")
+            Logger.log(f'Executing right model for number of frames: {frames_to_process}')
+            right_model_start_time = datetime.datetime.now()
+            left_model_output = tf.stack(data_batch)
+            print(left_model_output.shape)
+            reshaped_tensor = tf.expand_dims(tf.reshape(left_model_output, input_shape), axis=0)
+            model = ResNet50(weights='imagenet', include_top=False, input_shape=input_shape)
+            model_custom = models.Model(inputs=model.input, outputs=model.output)
+            right_model_output = model_custom(reshaped_tensor)  # Pass the stacked_tensors as a list
+        except BaseException as e:
+            print('Failed to do something: ' + str(e))
         right_model_end_time = datetime.datetime.now()
         add_to_total_right_model_time((right_model_end_time - right_model_start_time).total_seconds())
-        return_data_batch = [{'result': right_model_output, 'frame_seq_no': len(frame_seq_nos)}]
+        return_data_batch = {'result': right_model_output, 'frame_seq_no': frames_to_process, 'right_model_time':total_right_model_time}
         print('executed    ')
         return return_data_batch
         
-        
+
 def process_batch(client_data_dict):
-    """
-    This function will process the batch data collected from clients.
-    Implement your batch processing logic here.
-    """
-    batch_response_dict = {}
     with tf.device(device):
-        data_val = list(client_data_dict.values())
-        data_keys = list(client_data_dict.keys())
+        data_val = client_data_dict['data']
         output_data_val = model_right(data_val)
-        batch_response_dict = dict(zip(data_keys, output_data_val))
-        return batch_response_dict
-    
-    
-'''def process_split_point(x):
-    global right_model
-    global left_model
-    global split_point
-    global ips
-    global ops
-    batch_response_dict = {}
-    split_layer = model.layers[x] 
-    left_model = tf.keras.Model(inputs=model.input, outputs=split_layer.output)
-    next_layer = model.layers[x + 1]
-    print(f'Starting from layer # {x + 1} in server. Layer name: {next_layer.name}')
-    ops = model.output
-    right_model = keras.Model(inputs=next_layer.input, outputs=model.output)
-    #ToDo not necessary
-    dry_run_right_model(left_model, right_model, input_size.get(model_name))
-    return [pickle.dumps('Right model is ready.')]'''
-    
-def process_split_point(x):
-    global right_model
-    global left_model
-    global split_point
-    global ips
-    global ops
-    batch_response_dict = {}
-    split_layer = model.layers[x] 
-    left_model = tf.keras.Model(inputs=model.input, outputs=split_layer.output)
-    next_layer = model.layers[x + 1]
-    print(f'Starting from layer # {x + 1} in server. Layer name: {next_layer.name}')
-    ops = model.output
-    right_model = keras.Model(inputs=next_layer.input, outputs=model.output)
-    #ToDo not necessary
-    dry_run_right_model(left_model, right_model, input_size.get(model_name))
-    return [pickle.dumps('Right model is ready.')]
-    
-def process_split_point_batch(split_point_client_data_dict):
-    """
-    Your batch processing logic for split point data here...
-    For the example, just returning the data as is.
-    """
-    
-    batch_response_dict = {}
-    with tf.device(device):
-        # Your model's batch processing logic here...
-        data = pd.DataFrame(list(split_point_client_data_dict.values()))
-        keys = data['client_id']
-        split_point = data['split_point']
-        output_data_val = map(process_split_point, split_point)
-        # Sample logic: return the received data
-        batch_response_dict = dict(zip(keys, output_data_val))
-        return batch_response_dict
-    
-
-def get_total_right_model_time(data):
-    global total_right_model_time
-    client_split_point = data['split_point']
-    return_data = None
-    if client_split_point == split_point:
-        return_data = {'total_right_model_time': total_right_model_time}
-        # Reset time for the next split point.
-        total_right_model_time = 0
-    else:
-        return_data = {'total_right_model_time': f'split point mismatch. Expected {split_point} but received {client_split_point}.'}
-    return pickle.dumps(return_data)
-
+        #batch_response_dict = dict(zip(data_keys, output_data_val))
+        return output_data_val
 
 def add_to_total_right_model_time(current_frame_exec_time):
     global total_right_model_time
     total_right_model_time += current_frame_exec_time
 
 
-def make_app():
-    return tornado.web.Application([
-        (r"/model", ModelHandler),
-        (r"/split_point", SplitPointHandler),
-        (r"/right_model_time", TimeHandler)
-    ])
+def handle_client(conn, addr):
+    global lst_load_batches
+    try:
+        buffer2 = None
+        buffer = bytearray()
+        for i in range(len(split_points)*frames_to_process):
+            for i in range(LIMITS_no):
+                # Receive a packet
+                packet_data = conn.recv(SIZE)
+                if buffer2 != None:
+                    packet_data = buffer2 + packet_data
+                    buffer2 = None
+                # Append the received packet data to the buffer
+                buffer.extend(packet_data)
+                try:
+                    index = buffer.index(b"}")
+                    # Create a new byte array up to and including the "}" symbol
+                    temp1 = buffer[index + 1:]
+                    buffer = buffer[:index + 1]
+                    temp2 = buffer2
+                    if temp1 is not None and temp2 is not None:
+                        temp1 += temp2
+                        buffer2 = temp1
+                except:
+                    pass
+            print("buffer",len(buffer))
+            print(f"Received data from {addr}: {buffer}")
+            lst_load_batches.append(json.loads(buffer.decode()))
+            print("Appended!!!!!!!!", len(lst_load_batches))
+    except BaseException as e:
+        print('handle_client: ' + str(e))
+
+def handle_client_batch(conn, addr, batch):
+    for j in range(len(split_points)):  
+        result = post_process_batch(batch)
+        post_client(conn, addr, result)
+        print("Client handled successfully",j)
+    
+
+def post_client(conn, addr, result):
+    post_data = {}
+    data = tf.stack(result['result'])
+    try:
+        encoded_data = base64.b64encode(data.numpy().tobytes()).decode()
+        post_data = {'result':encoded_data, 'frame_seq_no':result['frame_seq_no'],'right_model_time':result['right_model_time']}
+        byte_array = json.dumps(post_data).encode()
+        print('byte_array',len(byte_array))
+        conn.sendto(byte_array, ADDR)
+        offset = 0
+        while offset < len(byte_array):
+            # Copy a portion of the byte array into the packet
+            packet_data = byte_array[offset:offset + SIZE]
+
+            # Send the packet over UDP
+            conn.sendto(packet_data, ADDR)
+
+            # Update the offset
+            offset += SIZE
+    except BaseException as e:
+        print("post_client: " + str(e))
+
+def run_clients(lst_conn, lst_addr):
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            futures = []
+            for conn, addr in zip(lst_conn, lst_addr):
+                print("Got connection over : ",addr)
+                future = pool.submit(handle_client, conn, addr)
+                futures.append(future)
+            # Wait for all tasks to complete
+            concurrent.futures.wait(futures)
+        print(len(lst_load_batches),"lst_load_batches")
+    except BaseException as e:
+        print("post_client: " + str(e))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        futures = []
+        client_id1 = []
+        client_id2 = []
+        client_id3 = []
+        client_id4 = []
+        for i in lst_load_batches:
+            if i['client_id'] == "client_1":
+                client_id1.append(i)
+            elif i['client_id'] == "client_2":
+                client_id2.append(i)
+            elif i['client_id'] == "client_3":
+                client_id3.append(i)
+            elif i['client_id'] == "client_4":
+                client_id4.append(i)
+        print(len(client_id1),len(client_id2),len(client_id3),len(client_id4),"len(client_id)")
+        lst = [client_id1, client_id2, client_id3, client_id4]
+        for conn, addr, batch in zip(lst_conn, lst_addr, lst):
+            future = pool.submit(handle_client_batch, conn, addr, batch)
+            futures.append(future)
+        # Wait for all tasks to complete
+        concurrent.futures.wait(futures)
+    time.sleep(5)
+    
+def main():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(ADDR)
+    server.listen()
+    print(f"[LISTENING] Server is listening on {IP}:{PORT}")
+    i = 0
+    lst_conn = []
+    lst_addr = []
+    while i < BATCH_SIZE:
+        conn, addr = server.accept()
+        lst_conn.append(conn)
+        lst_addr.append(addr)
+        i += 1
+    run_clients(lst_conn, lst_addr)
 
 
-with tf.device(device):
-    if __name__ == "__main__":
-        app = make_app()
-        app.listen(8881)
-        print("Server started")
-        tornado.ioloop.IOLoop.current().start()
-
+if __name__ == "__main__":
+    main()
